@@ -5,18 +5,25 @@ attention. Repository checks run concurrently, and the release binary has no
 runtime dependencies beyond Git.
 
 ```text
-STATE  BRANCH  SYNC  CHANGES  REPOSITORY
-clean  main    =     -        api
-dirty  dev     ↑2    1S 2M 1? web
-clean  main    -     -        experiments/demo
+STATE  BRANCH  SYNC   CHANGES   REPOSITORY
+clean  main    =      -         api
+clean  main    -      -         experiments/demo
+merge  main    ↑1 ↓1  1! 1*     payments
+dirty  dev     ↑2     1S 2M 1?  web
 ```
 
 - `S`: staged entries
 - `M`: unstaged tracked entries
 - `?`: untracked entries
 - `!`: conflicted entries
+- `*`: stash entries (counts appear with Git 2.35+; repo-scout itself needs
+  Git 2.14+, where `--show-stash` was added)
 - `↑` / `↓`: commits ahead of / behind the upstream branch
 - `gone`: an upstream is configured but no longer exists on the remote
+- STATE also surfaces operations in progress: `merge`, `rebase`, `cherry-pick`,
+  `revert`, and `bisect`
+
+Run `repo-scout --legend` for the full color-coded key.
 
 ## Build and install
 
@@ -31,11 +38,18 @@ cargo install --path .
 # Scan the current directory, four levels deep.
 repo-scout
 
+# Everything worth acting on: changes, ahead/behind or gone upstreams,
+# stashes, operations in progress, and errors.
+repo-scout --attention ~/src
+
 # Only repositories with changes, using a cheaper tracked-files-only check.
 repo-scout --dirty --tracked-only ~/src
 
 # Machine-readable output across multiple roots.
 repo-scout --json ~/work ~/personal | jq '.[] | select(.state != "clean")'
+
+# Shell completions (bash, zsh, or fish).
+repo-scout --completions bash > ~/.local/share/bash-completion/completions/repo-scout
 ```
 
 Run `repo-scout --help` for every option. Common dependency and build directories

@@ -1021,7 +1021,10 @@ mod tests {
         fs::write(ignored.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
         let repositories = discover(std::slice::from_ref(&root), 4).unwrap();
-        assert_eq!(repositories, vec![root.join("projects/one")]);
+        // discover() canonicalizes roots; on macOS the temp dir itself is a
+        // symlink (/var -> /private/var), so the expectation must match.
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        assert_eq!(repositories, vec![canonical_root.join("projects/one")]);
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -1039,7 +1042,7 @@ mod tests {
         fs::write(root.join("nested/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
 
         let repositories = discover(std::slice::from_ref(&root), 0).unwrap();
-        assert_eq!(repositories, vec![root.clone()]);
+        assert_eq!(repositories, vec![fs::canonicalize(&root).unwrap()]);
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -1,0 +1,14 @@
+[package]
+name = "repo-scout"
+version = "0.1.0"
+edition = "2024"
+description = "Scan a directory of Git repositories and see what needs attention"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+codegen-units = 1
+lto = true
+panic = "abort"
+strip = true

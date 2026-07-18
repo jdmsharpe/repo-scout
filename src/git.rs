@@ -152,19 +152,7 @@ pub fn inspect_all(repositories: Vec<PathBuf>, jobs: usize, tracked_only: bool) 
 }
 
 fn inspect(path: &Path, tracked_only: bool) -> Report {
-    let untracked = if tracked_only { "no" } else { "normal" };
-    let output = Command::new("git")
-        .arg("-c")
-        .arg("color.ui=false")
-        .arg("-C")
-        .arg(path)
-        .arg("status")
-        .arg("--porcelain=v2")
-        .arg("--branch")
-        .arg("-z")
-        .arg(format!("--untracked-files={untracked}"))
-        .env("LC_ALL", "C")
-        .output();
+    let output = status_command(path, tracked_only).output();
 
     match output {
         Ok(output) if output.status.success() => {
@@ -193,6 +181,24 @@ fn inspect(path: &Path, tracked_only: bool) -> Report {
             error: Some(format!("could not run Git: {error}")),
         },
     }
+}
+
+fn status_command(path: &Path, tracked_only: bool) -> Command {
+    let untracked = if tracked_only { "no" } else { "normal" };
+    let mut command = Command::new("git");
+    command
+        .arg("-c")
+        .arg("color.ui=false")
+        .arg("-C")
+        .arg(path)
+        .arg("status")
+        .arg("--porcelain=v2")
+        .arg("--branch")
+        .arg("-z")
+        .arg(format!("--untracked-files={untracked}"))
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    command
 }
 
 fn stderr_message(stderr: &[u8], code: Option<i32>) -> String {
@@ -315,6 +321,19 @@ mod tests {
         assert_eq!(report.changes.unstaged, 2);
         assert_eq!(report.changes.untracked, 1);
         assert_eq!(report.changes.conflicted, 1);
+    }
+
+    #[test]
+    fn status_command_disables_optional_locks() {
+        use std::ffi::OsStr;
+
+        let command = status_command(Path::new("."), false);
+        let optional_locks = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("GIT_OPTIONAL_LOCKS"))
+            .and_then(|(_, value)| value);
+
+        assert_eq!(optional_locks, Some(OsStr::new("0")));
     }
 
     #[test]

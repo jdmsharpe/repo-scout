@@ -1,5 +1,12 @@
 # repo-scout
 
+![Hits](https://hitscounter.dev/api/hit?url=https%3A%2F%2Fgithub.com%2Fjdmsharpe%2Frepo-scout%2F&label=repo-scout&icon=github&color=%23198754&message=&style=flat&tz=UTC)
+[![Version](https://img.shields.io/github/v/tag/jdmsharpe/repo-scout?sort=semver&label=version)](https://github.com/jdmsharpe/repo-scout/tags)
+[![License](https://img.shields.io/github/license/jdmsharpe/repo-scout?label=license)](./LICENSE)
+[![CI](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml/badge.svg)](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml)
+[![Downloads](https://img.shields.io/github/downloads/jdmsharpe/repo-scout/total?label=downloads&logo=github)](https://github.com/jdmsharpe/repo-scout/releases)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+
 `repo-scout` scans a directory full of Git repositories and shows which ones need
 attention. Repository checks run concurrently, and the release binary has no
 runtime dependencies beyond Git.

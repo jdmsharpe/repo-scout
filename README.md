@@ -52,8 +52,41 @@ repo-scout --json ~/work ~/personal | jq '.[] | select(.state != "clean")'
 repo-scout --completions bash > ~/.local/share/bash-completion/completions/repo-scout
 ```
 
-Run `repo-scout --help` for every option. Common dependency and build directories
-(`node_modules`, `.venv`, `target`, and `vendor`) are skipped during discovery.
+`repo-scout --help` output follows.
+
+```
+USAGE:
+    repo-scout [OPTIONS] [--] [ROOT ...]
+
+ARGS:
+    [ROOT ...]             Directories to scan (default: current directory)
+    --                     Treat every following argument as a ROOT
+
+OPTIONS:
+    -a, --attention        Show only repositories needing attention: changes,
+                           ahead/behind or gone upstreams, stashes, operations
+                           in progress, and errors
+    -d, --dirty            Show only dirty repositories and errors
+        --json             Emit a JSON array instead of a table
+    -j, --jobs <COUNT>     Concurrent Git processes (default: CPU count, max 16)
+        --max-depth <N>    Directory levels to search (default: 4)
+        --tracked-only     Skip untracked files for a faster scan
+        --no-color         Disable colored status labels
+        --legend           Explain the table columns and states, then exit
+        --completions <SHELL>
+                           Print a completion script for bash, zsh, or fish
+    -h, --help             Print help
+    -V, --version          Print version
+
+EXAMPLES:
+    repo-scout ~/src
+    repo-scout --attention ~/src
+    repo-scout --dirty --tracked-only ~/src
+    repo-scout --json ~/work ~/personal
+```
+
+Common dependency and build directories (`node_modules`, `.venv`, `target`, and `vendor`) 
+are skipped during discovery.
 
 ## Performance
 

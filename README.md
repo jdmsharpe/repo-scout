@@ -4,7 +4,6 @@
 [![Version](https://img.shields.io/github/v/tag/jdmsharpe/repo-scout?sort=semver&label=version)](https://github.com/jdmsharpe/repo-scout/tags)
 [![License](https://img.shields.io/github/license/jdmsharpe/repo-scout?label=license)](./LICENSE)
 [![CI](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml/badge.svg)](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml)
-[![Downloads](https://img.shields.io/github/downloads/jdmsharpe/repo-scout/total?label=downloads&logo=github)](https://github.com/jdmsharpe/repo-scout/releases)
 [![Dependencies](https://deps.rs/repo/github/jdmsharpe/repo-scout/status.svg)](https://deps.rs/repo/github/jdmsharpe/repo-scout)
 
 `repo-scout` scans a directory full of Git repositories and shows which ones need

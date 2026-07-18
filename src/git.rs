@@ -28,6 +28,60 @@ impl Changes {
     }
 }
 
+/// A multi-step Git operation that was started but not yet concluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+impl Operation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Operation::Merge => "merge",
+            Operation::Rebase => "rebase",
+            Operation::CherryPick => "cherry-pick",
+            Operation::Revert => "revert",
+            Operation::Bisect => "bisect",
+        }
+    }
+}
+
+/// What the STATE column reports for a repository.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum State {
+    Clean,
+    Dirty,
+    InProgress(Operation),
+    Error,
+}
+
+impl State {
+    /// Every state a report can show, in legend order.
+    pub const ALL: [State; 8] = [
+        State::Clean,
+        State::Dirty,
+        State::InProgress(Operation::Merge),
+        State::InProgress(Operation::Rebase),
+        State::InProgress(Operation::CherryPick),
+        State::InProgress(Operation::Revert),
+        State::InProgress(Operation::Bisect),
+        State::Error,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            State::Clean => "clean",
+            State::Dirty => "dirty",
+            State::InProgress(operation) => operation.label(),
+            State::Error => "error",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     pub path: PathBuf,
@@ -37,6 +91,8 @@ pub struct Report {
     pub upstream_gone: bool,
     pub ahead: usize,
     pub behind: usize,
+    pub stash: usize,
+    pub operation: Option<Operation>,
     pub changes: Changes,
     pub error: Option<String>,
 }
@@ -46,13 +102,27 @@ impl Report {
         self.changes.any()
     }
 
-    pub fn state(&self) -> &'static str {
+    /// Anything worth acting on: changes, an unfinished operation, divergence
+    /// from the upstream, a pruned upstream, stashed work, or an error.
+    pub fn needs_attention(&self) -> bool {
+        self.error.is_some()
+            || self.operation.is_some()
+            || self.is_dirty()
+            || self.ahead > 0
+            || self.behind > 0
+            || self.upstream_gone
+            || self.stash > 0
+    }
+
+    pub fn state(&self) -> State {
         if self.error.is_some() {
-            "error"
+            State::Error
+        } else if let Some(operation) = self.operation {
+            State::InProgress(operation)
         } else if self.is_dirty() {
-            "dirty"
+            State::Dirty
         } else {
-            "clean"
+            State::Clean
         }
     }
 }
@@ -166,6 +236,7 @@ fn inspect(path: &Path, tracked_only: bool) -> Report {
         Ok(Some(output)) if output.status.success() => {
             let mut report = parse_status(&output.stdout);
             report.path = path.to_path_buf();
+            report.operation = detect_operation(path);
             report
         }
         Ok(Some(output)) => {
@@ -188,8 +259,61 @@ fn error_report(path: &Path, message: String) -> Report {
         upstream_gone: false,
         ahead: 0,
         behind: 0,
+        stash: 0,
+        operation: None,
         changes: Changes::default(),
         error: Some(message),
+    }
+}
+
+/// Detects an in-progress operation from the repository's private git dir.
+/// Ordering mirrors `git status`: a conflicted rebase also leaves
+/// CHERRY_PICK_HEAD behind, so the rebase directories are checked first.
+fn detect_operation(worktree: &Path) -> Option<Operation> {
+    let git_dir = resolve_git_dir(worktree)?;
+    if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
+        Some(Operation::Rebase)
+    } else if git_dir.join("MERGE_HEAD").is_file() {
+        Some(Operation::Merge)
+    } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
+        Some(Operation::CherryPick)
+    } else if git_dir.join("REVERT_HEAD").is_file() {
+        Some(Operation::Revert)
+    } else if git_dir.join("BISECT_LOG").is_file() {
+        Some(Operation::Bisect)
+    } else {
+        None
+    }
+}
+
+fn resolve_git_dir(worktree: &Path) -> Option<PathBuf> {
+    let marker = worktree.join(".git");
+    let file_type = fs::metadata(&marker).ok()?.file_type();
+    if file_type.is_dir() {
+        return Some(marker);
+    }
+    // Only a regular file may be opened: a `.git` FIFO would block the read
+    // forever. Linked worktrees and submodules point at their git dir through
+    // a `gitdir: <path>` file. Cap the read so a hostile oversized `.git`
+    // file cannot balloon memory.
+    if !file_type.is_file() {
+        return None;
+    }
+    let mut contents = String::new();
+    fs::File::open(&marker)
+        .ok()?
+        .take(4096)
+        .read_to_string(&mut contents)
+        .ok()?;
+    let target = contents.strip_prefix("gitdir:")?.trim();
+    if target.is_empty() {
+        return None;
+    }
+    let target = Path::new(target);
+    if target.is_absolute() {
+        Some(target.to_path_buf())
+    } else {
+        Some(worktree.join(target))
     }
 }
 
@@ -286,6 +410,11 @@ fn status_command(path: &Path, tracked_only: bool) -> Command {
         .arg("status")
         .arg("--porcelain=v2")
         .arg("--branch")
+        // Stash counts ride the same porcelain stream: Git >= 2.35 emits a
+        // `# stash <N>` header; 2.14-2.34 accept the flag and omit the
+        // header. Older Git fails loudly (error rows), raising the floor
+        // this tool already had for --porcelain=v2.
+        .arg("--show-stash")
         .arg("-z")
         .arg(format!("--untracked-files={untracked}"))
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -323,15 +452,26 @@ pub fn parse_status(bytes: &[u8]) -> Report {
         upstream_gone: false,
         ahead: 0,
         behind: 0,
+        stash: 0,
+        operation: None,
         changes: Changes::default(),
         error: None,
     };
     let mut saw_ab = false;
+    let mut skip_orig_path = false;
 
     for raw_record in bytes
         .split(|byte| *byte == 0)
         .filter(|record| !record.is_empty())
     {
+        // In `-z` mode a rename/copy record (`2 ...`) is followed by the
+        // original path as its own NUL-terminated record. That record is
+        // untrusted file-name data and must never be parsed as a header: a
+        // file renamed from "# stash 99" would otherwise spoof the counts.
+        if skip_orig_path {
+            skip_orig_path = false;
+            continue;
+        }
         let record = String::from_utf8_lossy(raw_record);
         if let Some(value) = record.strip_prefix("# branch.head ") {
             report.branch = if value == "(detached)" {
@@ -344,7 +484,10 @@ pub fn parse_status(bytes: &[u8]) -> Report {
         } else if let Some(value) = record.strip_prefix("# branch.ab ") {
             saw_ab = true;
             parse_ahead_behind(value, &mut report);
+        } else if let Some(value) = record.strip_prefix("# stash ") {
+            report.stash = value.trim().parse().unwrap_or(0);
         } else if record.starts_with("1 ") || record.starts_with("2 ") {
+            skip_orig_path = record.starts_with("2 ");
             if let Some(xy) = record.split_ascii_whitespace().nth(1) {
                 let mut states = xy.bytes();
                 if states.next().is_some_and(|state| state != b'.') {
@@ -474,6 +617,206 @@ mod tests {
         assert_eq!(report.upstream.as_deref(), Some("origin/feature"));
         assert!(report.upstream_gone);
         assert_eq!((report.ahead, report.behind), (0, 0));
+    }
+
+    #[test]
+    fn parses_stash_header() {
+        let input = concat!("# branch.head main\0", "# stash 3\0");
+        let report = parse_status(input.as_bytes());
+
+        assert_eq!(report.stash, 3);
+        assert!(!report.is_dirty(), "stashes alone must not read as dirty");
+        assert!(report.needs_attention());
+    }
+
+    #[test]
+    fn rename_orig_paths_cannot_spoof_headers() {
+        // `2 ` records carry the original path as a separate NUL record; a
+        // hostile file name must not be read as a stash or branch header.
+        let input = concat!(
+            "# branch.head main\0",
+            "# branch.upstream origin/main\0",
+            "# branch.ab +0 -0\0",
+            "2 R. N... 100644 100644 100644 aaa bbb R100 renamed.txt\0",
+            "# stash 99\0",
+            "2 R. N... 100644 100644 100644 aaa bbb R100 other.txt\0",
+            "# branch.ab +9 -9\0",
+            "? real-untracked.txt\0",
+        );
+        let report = parse_status(input.as_bytes());
+
+        assert_eq!(report.stash, 0, "orig path must not spoof the stash count");
+        assert_eq!(
+            (report.ahead, report.behind),
+            (0, 0),
+            "orig path must not spoof ahead/behind"
+        );
+        assert_eq!(report.changes.staged, 2);
+        assert_eq!(report.changes.untracked, 1);
+    }
+
+    #[test]
+    fn status_command_requests_stash_counts() {
+        use std::ffi::OsStr;
+
+        let command = status_command(Path::new("."), false);
+        let requests_stash = command
+            .get_args()
+            .any(|arg| arg == OsStr::new("--show-stash"));
+
+        assert!(requests_stash, "--show-stash must ride the status call");
+    }
+
+    #[test]
+    fn attention_flags_divergence_stash_and_operations() {
+        let base = Report {
+            path: PathBuf::new(),
+            display_path: String::new(),
+            branch: "main".into(),
+            upstream: Some("origin/main".into()),
+            upstream_gone: false,
+            ahead: 0,
+            behind: 0,
+            stash: 0,
+            operation: None,
+            changes: Changes::default(),
+            error: None,
+        };
+
+        assert!(!base.needs_attention());
+        for needy in [
+            Report {
+                ahead: 1,
+                ..base.clone()
+            },
+            Report {
+                behind: 2,
+                ..base.clone()
+            },
+            Report {
+                upstream_gone: true,
+                ..base.clone()
+            },
+            Report {
+                stash: 1,
+                ..base.clone()
+            },
+            Report {
+                operation: Some(Operation::Rebase),
+                ..base.clone()
+            },
+            Report {
+                error: Some("boom".into()),
+                ..base.clone()
+            },
+        ] {
+            assert!(needy.needs_attention(), "{needy:?} must need attention");
+        }
+    }
+
+    #[test]
+    fn state_prefers_error_then_operation_over_dirty() {
+        let mut report = parse_status(b"? new.txt\0");
+        assert_eq!(report.state(), State::Dirty);
+
+        report.operation = Some(Operation::Merge);
+        assert_eq!(report.state(), State::InProgress(Operation::Merge));
+
+        report.error = Some("boom".into());
+        assert_eq!(report.state(), State::Error);
+    }
+
+    #[test]
+    fn detects_operations_from_git_dir_markers() {
+        let root = unique_temp_dir("repo-scout-operation");
+        let git_dir = root.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(detect_operation(&root), None);
+
+        fs::write(git_dir.join("MERGE_HEAD"), "abc\n").unwrap();
+        assert_eq!(detect_operation(&root), Some(Operation::Merge));
+
+        // A conflicted rebase also writes CHERRY_PICK_HEAD; rebase must win.
+        fs::write(git_dir.join("CHERRY_PICK_HEAD"), "abc\n").unwrap();
+        fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
+        assert_eq!(detect_operation(&root), Some(Operation::Rebase));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn resolves_gitfile_pointer_for_linked_worktrees() {
+        let root = unique_temp_dir("repo-scout-gitfile");
+        let worktree = root.join("wt");
+        let git_dir = root.join("gitdirs/wt");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::create_dir_all(git_dir.join("rebase-apply")).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: ../gitdirs/wt\n").unwrap();
+
+        assert_eq!(detect_operation(&worktree), Some(Operation::Rebase));
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn inspect_counts_stash_entries() {
+        if !git_available() || !git_supports_porcelain_stash() {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-stash");
+        fs::create_dir_all(&root).unwrap();
+
+        init_main_repo(&root);
+        fs::write(root.join("file.txt"), "one\n").unwrap();
+        git(&root, &["add", "file.txt"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        fs::write(root.join("file.txt"), "two\n").unwrap();
+        git(&root, &["stash", "-q"]);
+
+        let report = inspect(&root, false);
+
+        assert!(report.error.is_none(), "status errored: {:?}", report.error);
+        assert_eq!(report.stash, 1);
+        assert!(!report.is_dirty());
+        assert_eq!(report.state(), State::Clean);
+        assert!(report.needs_attention());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn inspect_reports_merge_in_progress() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-merge");
+        fs::create_dir_all(&root).unwrap();
+
+        init_main_repo(&root);
+        // A global merge.ff=only would refuse the merge before it conflicts.
+        git(&root, &["config", "merge.ff", "false"]);
+        fs::write(root.join("file.txt"), "base\n").unwrap();
+        git(&root, &["add", "file.txt"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        git(&root, &["checkout", "-q", "-b", "feature"]);
+        fs::write(root.join("file.txt"), "feature\n").unwrap();
+        git(&root, &["commit", "-q", "-a", "-m", "feature"]);
+        git(&root, &["checkout", "-q", "main"]);
+        fs::write(root.join("file.txt"), "main\n").unwrap();
+        git(&root, &["commit", "-q", "-a", "-m", "main"]);
+        // The conflicting merge is expected to fail and leave MERGE_HEAD.
+        let merged = git_allowing_failure(&root, &["merge", "-q", "feature"]);
+        assert!(!merged, "the fixture merge must conflict");
+
+        let report = inspect(&root, false);
+
+        assert!(report.error.is_none(), "status errored: {:?}", report.error);
+        assert_eq!(report.state(), State::InProgress(Operation::Merge));
+        assert_eq!(report.changes.conflicted, 1);
+        assert!(report.needs_attention());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -611,15 +954,48 @@ mod tests {
     }
 
     fn git(dir: &Path, args: &[&str]) {
-        let status = Command::new("git")
+        assert!(git_allowing_failure(dir, args), "git {args:?} failed");
+    }
+
+    fn git_allowing_failure(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
             .arg("-C")
             .arg(dir)
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .unwrap();
-        assert!(status.success(), "git {args:?} failed");
+            .unwrap()
+            .success()
+    }
+
+    /// Fixture repos must not depend on the developer's global Git config
+    /// (signing, hooks, templates, init.defaultBranch) or on a recent Git:
+    /// `git init -b` needs 2.28, `git symbolic-ref` works everywhere.
+    fn init_main_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(dir, &["config", "user.email", "scout@example.invalid"]);
+        git(dir, &["config", "user.name", "Repo Scout"]);
+        git(dir, &["config", "commit.gpgsign", "false"]);
+        git(dir, &["config", "core.hooksPath", "/dev/null"]);
+    }
+
+    fn git_supports_porcelain_stash() -> bool {
+        // The `# stash` porcelain v2 header arrived in Git 2.35.
+        let Ok(output) = Command::new("git").arg("--version").output() else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut numbers = text
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_default()
+            .split('.')
+            .map_while(|part| part.parse::<u32>().ok());
+        let major = numbers.next().unwrap_or(0);
+        let minor = numbers.next().unwrap_or(0);
+        (major, minor) >= (2, 35)
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

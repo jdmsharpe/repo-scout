@@ -1,4 +1,5 @@
 mod cli;
+mod completions;
 mod git;
 mod output;
 
@@ -17,6 +18,14 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
         }
         Ok(Command::Version) => {
             println!("repo-scout {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        Ok(Command::Legend { no_color }) => {
+            output::print_legend(!no_color && cli::stdout_colors());
+            return ExitCode::SUCCESS;
+        }
+        Ok(Command::Completions(shell)) => {
+            print!("{}", shell.script());
             return ExitCode::SUCCESS;
         }
         Err(message) => {
@@ -39,7 +48,10 @@ pub fn run(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     git::assign_display_paths(&mut reports, &options.roots);
     reports.sort_by(|left, right| left.display_path.cmp(&right.display_path));
 
-    if options.dirty_only {
+    // --attention is a superset of --dirty, so it wins when both are given.
+    if options.attention_only {
+        reports.retain(|report| report.needs_attention());
+    } else if options.dirty_only {
         reports.retain(|report| report.is_dirty() || report.error.is_some());
     }
 

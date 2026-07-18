@@ -6,6 +6,7 @@
 [![CI](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml/badge.svg)](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml)
 [![Downloads](https://img.shields.io/github/downloads/jdmsharpe/repo-scout/total?label=downloads&logo=github)](https://github.com/jdmsharpe/repo-scout/releases)
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Dependencies](https://deps.rs/repo/github/jdmsharpe/repo-scout/status.svg)](https://deps.rs/repo/github/jdmsharpe/repo-scout)
 
 `repo-scout` scans a directory full of Git repositories and shows which ones need
 attention. Repository checks run concurrently, and the release binary has no
@@ -33,6 +34,9 @@ dirty  dev     ↑2     1S 2M 1?  web
 Run `repo-scout --legend` for the full color-coded key.
 
 ## Build and install
+
+Prebuilt binaries for Linux (x86_64) and macOS (Intel and Apple Silicon) are attached to each
+[GitHub release](https://github.com/jdmsharpe/repo-scout/releases). Or build from source:
 
 ```bash
 cargo build --release

@@ -1,9 +1,18 @@
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
+
+/// Upper bound on a single `git status` invocation. A repository on a dead
+/// network mount or behind a wedged hook is reported as an error rather than
+/// stalling the entire scan.
+const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often to poll whether the spawned `git` has finished.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Changes {
@@ -25,6 +34,7 @@ pub struct Report {
     pub display_path: String,
     pub branch: String,
     pub upstream: Option<String>,
+    pub upstream_gone: bool,
     pub ahead: usize,
     pub behind: usize,
     pub changes: Changes,
@@ -152,35 +162,112 @@ pub fn inspect_all(repositories: Vec<PathBuf>, jobs: usize, tracked_only: bool) 
 }
 
 fn inspect(path: &Path, tracked_only: bool) -> Report {
-    let output = status_command(path, tracked_only).output();
-
-    match output {
-        Ok(output) if output.status.success() => {
+    match run_status(path, tracked_only) {
+        Ok(Some(output)) if output.status.success() => {
             let mut report = parse_status(&output.stdout);
             report.path = path.to_path_buf();
             report
         }
-        Ok(output) => Report {
-            path: path.to_path_buf(),
-            display_path: String::new(),
-            branch: "-".into(),
-            upstream: None,
-            ahead: 0,
-            behind: 0,
-            changes: Changes::default(),
-            error: Some(stderr_message(&output.stderr, output.status.code())),
-        },
-        Err(error) => Report {
-            path: path.to_path_buf(),
-            display_path: String::new(),
-            branch: "-".into(),
-            upstream: None,
-            ahead: 0,
-            behind: 0,
-            changes: Changes::default(),
-            error: Some(format!("could not run Git: {error}")),
-        },
+        Ok(Some(output)) => {
+            error_report(path, stderr_message(&output.stderr, output.status.code()))
+        }
+        Ok(None) => error_report(
+            path,
+            format!("Git status timed out after {} s", STATUS_TIMEOUT.as_secs()),
+        ),
+        Err(error) => error_report(path, format!("could not run Git: {error}")),
     }
+}
+
+fn error_report(path: &Path, message: String) -> Report {
+    Report {
+        path: path.to_path_buf(),
+        display_path: String::new(),
+        branch: "-".into(),
+        upstream: None,
+        upstream_gone: false,
+        ahead: 0,
+        behind: 0,
+        changes: Changes::default(),
+        error: Some(message),
+    }
+}
+
+fn run_status(path: &Path, tracked_only: bool) -> io::Result<Option<Output>> {
+    run_with_timeout(status_command(path, tracked_only), STATUS_TIMEOUT)
+}
+
+/// Spawns `command`, draining its pipes on helper threads so a large status
+/// cannot deadlock the wait. Both the process and pipe collection share the
+/// same deadline, so descendants that inherit a pipe cannot stall the scan.
+/// Returns `Ok(None)` when the timeout fires.
+fn run_with_timeout(mut command: Command, timeout: Duration) -> io::Result<Option<Output>> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout is piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr is piped");
+    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buffer);
+        let _ = stdout_sender.send(buffer);
+    });
+    std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer);
+        let _ = stderr_sender.send(buffer);
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                kill_and_reap(child);
+                return Err(error);
+            }
+        }
+        if Instant::now() >= deadline {
+            kill_and_reap(child);
+            return Ok(None);
+        }
+        std::thread::sleep(POLL_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    };
+
+    let Some(stdout) = receive_before(&stdout_receiver, deadline) else {
+        return Ok(None);
+    };
+    let Some(stderr) = receive_before(&stderr_receiver, deadline) else {
+        return Ok(None);
+    };
+    Ok(Some(Output {
+        status,
+        stdout,
+        stderr,
+    }))
+}
+
+fn receive_before(receiver: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Option<Vec<u8>> {
+    match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(buffer) => Some(buffer),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Some(Vec::new()),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+    }
+}
+
+/// Reap outside the timed path: `wait` can itself block if the child is stuck
+/// in an uninterruptible system call.
+fn kill_and_reap(mut child: Child) {
+    let _ = child.kill();
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 fn status_command(path: &Path, tracked_only: bool) -> Command {
@@ -189,6 +276,11 @@ fn status_command(path: &Path, tracked_only: bool) -> Command {
     command
         .arg("-c")
         .arg("color.ui=false")
+        // A scanned repository's own config must not be able to run code:
+        // core.fsmonitor can be set to an arbitrary command that `git status`
+        // would execute. A command-line -c outranks the repo's config.
+        .arg("-c")
+        .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(path)
         .arg("status")
@@ -197,7 +289,15 @@ fn status_command(path: &Path, tracked_only: bool) -> Command {
         .arg("-z")
         .arg(format!("--untracked-files={untracked}"))
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("LC_ALL", "C");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        // `git -C` changes directory but still honors an inherited GIT_DIR, so
+        // clear the ambient repo env or every repo reports GIT_DIR's status.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY");
     command
 }
 
@@ -220,11 +320,13 @@ pub fn parse_status(bytes: &[u8]) -> Report {
         display_path: String::new(),
         branch: "-".into(),
         upstream: None,
+        upstream_gone: false,
         ahead: 0,
         behind: 0,
         changes: Changes::default(),
         error: None,
     };
+    let mut saw_ab = false;
 
     for raw_record in bytes
         .split(|byte| *byte == 0)
@@ -240,6 +342,7 @@ pub fn parse_status(bytes: &[u8]) -> Report {
         } else if let Some(value) = record.strip_prefix("# branch.upstream ") {
             report.upstream = Some(value.into());
         } else if let Some(value) = record.strip_prefix("# branch.ab ") {
+            saw_ab = true;
             parse_ahead_behind(value, &mut report);
         } else if record.starts_with("1 ") || record.starts_with("2 ") {
             if let Some(xy) = record.split_ascii_whitespace().nth(1) {
@@ -257,6 +360,9 @@ pub fn parse_status(bytes: &[u8]) -> Report {
             report.changes.untracked += 1;
         }
     }
+    // git omits `# branch.ab` when the upstream ref no longer exists (a pruned
+    // remote branch), which must not be read as "in sync".
+    report.upstream_gone = report.upstream.is_some() && !saw_ab;
     report
 }
 
@@ -316,6 +422,7 @@ mod tests {
 
         assert_eq!(report.branch, "feature/cool");
         assert_eq!(report.upstream.as_deref(), Some("origin/feature/cool"));
+        assert!(!report.upstream_gone);
         assert_eq!((report.ahead, report.behind), (2, 3));
         assert_eq!(report.changes.staged, 2);
         assert_eq!(report.changes.unstaged, 2);
@@ -334,6 +441,193 @@ mod tests {
             .and_then(|(_, value)| value);
 
         assert_eq!(optional_locks, Some(OsStr::new("0")));
+    }
+
+    #[test]
+    fn status_command_neutralizes_repo_config_and_ambient_env() {
+        use std::ffi::OsStr;
+
+        let command = status_command(Path::new("."), false);
+
+        let disables_fsmonitor = command
+            .get_args()
+            .any(|arg| arg == OsStr::new("core.fsmonitor=false"));
+        assert!(disables_fsmonitor, "core.fsmonitor must be neutralized");
+
+        for key in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            let cleared = command
+                .get_envs()
+                .any(|(name, value)| name == OsStr::new(key) && value.is_none());
+            assert!(cleared, "{key} must be cleared from the child environment");
+        }
+    }
+
+    #[test]
+    fn reports_gone_upstream_when_branch_ab_is_absent() {
+        let input = concat!(
+            "# branch.oid abc123\0",
+            "# branch.head feature\0",
+            "# branch.upstream origin/feature\0",
+        );
+        let report = parse_status(input.as_bytes());
+
+        assert_eq!(report.upstream.as_deref(), Some("origin/feature"));
+        assert!(report.upstream_gone);
+        assert_eq!((report.ahead, report.behind), (0, 0));
+    }
+
+    #[test]
+    fn run_with_timeout_kills_a_slow_child() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+
+        let started = Instant::now();
+        let result = run_with_timeout(command, Duration::from_millis(200)).unwrap();
+
+        assert!(
+            result.is_none(),
+            "a child exceeding the timeout yields None"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the timeout must not wait for the child to finish"
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_captures_output_of_a_fast_child() {
+        let mut command = Command::new("printf");
+        command.arg("hello");
+
+        let output = run_with_timeout(command, Duration::from_secs(5))
+            .unwrap()
+            .expect("a fast child completes before the timeout");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"hello");
+    }
+
+    #[test]
+    fn run_with_timeout_does_not_wait_for_descendant_held_pipes() {
+        const HELPER_MODE: &str = "REPO_SCOUT_TIMEOUT_HELPER";
+
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "git::tests::timeout_descendant_helper",
+                "--nocapture",
+            ])
+            .env(HELPER_MODE, "spawn");
+
+        let started = Instant::now();
+        let result = run_with_timeout(command, Duration::from_millis(300)).unwrap();
+
+        assert!(result.is_none(), "inherited pipes must obey the deadline");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "pipe collection must not wait for the descendant"
+        );
+    }
+
+    #[test]
+    fn timeout_descendant_helper() {
+        const HELPER_MODE: &str = "REPO_SCOUT_TIMEOUT_HELPER";
+
+        match std::env::var(HELPER_MODE).as_deref() {
+            Ok("spawn") => {
+                let mut child = Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "git::tests::timeout_descendant_helper",
+                        "--nocapture",
+                    ])
+                    .env(HELPER_MODE, "sleep")
+                    .spawn()
+                    .unwrap();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Ok("sleep") => std::thread::sleep(Duration::from_secs(2)),
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn inspect_ignores_hostile_fsmonitor_config() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-fsmonitor");
+        fs::create_dir_all(&root).unwrap();
+        let sentinel = root.join("PWNED");
+
+        git(&root, &["init", "-q"]);
+        let payload = format!("touch {}; false", sentinel.display());
+        git(&root, &["config", "core.fsmonitor", &payload]);
+
+        let report = inspect(&root, false);
+
+        assert!(
+            !sentinel.exists(),
+            "a scanned repo's core.fsmonitor command must never run"
+        );
+        assert!(report.error.is_none(), "status errored: {:?}", report.error);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn inspect_reports_staged_and_untracked_changes() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-inspect");
+        fs::create_dir_all(&root).unwrap();
+
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("staged.txt"), "one\n").unwrap();
+        git(&root, &["add", "staged.txt"]);
+        fs::write(root.join("loose.txt"), "two\n").unwrap();
+
+        let report = inspect(&root, false);
+
+        assert!(report.error.is_none(), "status errored: {:?}", report.error);
+        assert!(report.is_dirty());
+        assert_eq!(report.changes.staged, 1);
+        assert_eq!(report.changes.untracked, 1);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn git_available() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
     }
 
     #[test]

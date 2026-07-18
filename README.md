@@ -16,6 +16,7 @@ clean  main    -     -        experiments/demo
 - `?`: untracked entries
 - `!`: conflicted entries
 - `↑` / `↓`: commits ahead of / behind the upstream branch
+- `gone`: an upstream is configured but no longer exists on the remote
 
 ## Build and install
 

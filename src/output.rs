@@ -62,6 +62,9 @@ fn sync_text(report: &Report) -> String {
     if report.upstream.is_none() {
         return "-".into();
     }
+    if report.upstream_gone {
+        return "gone".into();
+    }
     match (report.ahead, report.behind) {
         (0, 0) => "=".into(),
         (ahead, 0) => format!("↑{ahead}"),
@@ -111,11 +114,12 @@ pub fn print_json(reports: &[Report]) {
     for (index, report) in reports.iter().enumerate() {
         let comma = if index + 1 == reports.len() { "" } else { "," };
         println!(
-            "  {{\"path\":{},\"state\":{},\"branch\":{},\"upstream\":{},\"ahead\":{},\"behind\":{},\"changes\":{{\"staged\":{},\"unstaged\":{},\"untracked\":{},\"conflicted\":{}}},\"error\":{}}}{comma}",
+            "  {{\"path\":{},\"state\":{},\"branch\":{},\"upstream\":{},\"upstream_gone\":{},\"ahead\":{},\"behind\":{},\"changes\":{{\"staged\":{},\"unstaged\":{},\"untracked\":{},\"conflicted\":{}}},\"error\":{}}}{comma}",
             json_string(&report.path.to_string_lossy()),
             json_string(report.state()),
             json_string(&report.branch),
             json_optional(report.upstream.as_deref()),
+            report.upstream_gone,
             report.ahead,
             report.behind,
             report.changes.staged,
@@ -168,6 +172,33 @@ mod tests {
     fn truncates_by_characters() {
         assert_eq!(truncate("feature/very-long", 8), "feature…");
         assert_eq!(truncate("café", 4), "café");
+    }
+
+    fn report(upstream: Option<&str>, upstream_gone: bool, ahead: usize, behind: usize) -> Report {
+        Report {
+            path: std::path::PathBuf::new(),
+            display_path: String::new(),
+            branch: "main".into(),
+            upstream: upstream.map(String::from),
+            upstream_gone,
+            ahead,
+            behind,
+            changes: Changes::default(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn sync_text_covers_upstream_states() {
+        assert_eq!(sync_text(&report(None, false, 0, 0)), "-");
+        assert_eq!(sync_text(&report(Some("origin/main"), false, 0, 0)), "=");
+        assert_eq!(sync_text(&report(Some("origin/main"), false, 2, 0)), "↑2");
+        assert_eq!(sync_text(&report(Some("origin/main"), false, 0, 3)), "↓3");
+        assert_eq!(
+            sync_text(&report(Some("origin/main"), false, 1, 4)),
+            "↑1 ↓4"
+        );
+        assert_eq!(sync_text(&report(Some("origin/main"), true, 0, 0)), "gone");
     }
 
     #[test]

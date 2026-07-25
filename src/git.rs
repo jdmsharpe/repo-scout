@@ -87,12 +87,15 @@ pub struct Report {
     pub path: PathBuf,
     pub display_path: String,
     pub branch: String,
+    pub detached: bool,
+    pub head: Option<String>,
     pub upstream: Option<String>,
     pub upstream_gone: bool,
     pub ahead: usize,
     pub behind: usize,
     pub stash: usize,
     pub operation: Option<Operation>,
+    pub worktree: bool,
     pub changes: Changes,
     pub error: Option<String>,
 }
@@ -100,6 +103,13 @@ pub struct Report {
 impl Report {
     pub fn is_dirty(&self) -> bool {
         self.changes.any()
+    }
+
+    /// A branch that has never been pushed. It reports no divergence and no
+    /// upstream, so nothing else on the row distinguishes it from a branch
+    /// that is genuinely in sync.
+    pub fn unpublished(&self) -> bool {
+        self.error.is_none() && !self.detached && self.upstream.is_none()
     }
 
     /// Anything worth acting on: changes, an unfinished operation, divergence
@@ -127,7 +137,23 @@ impl Report {
     }
 }
 
-pub fn discover(roots: &[PathBuf], max_depth: usize) -> Result<Vec<PathBuf>, String> {
+/// Whether `git` can be executed at all. One clear message beats N identical
+/// per-repository ENOENTs.
+pub fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+pub fn discover(
+    roots: &[PathBuf],
+    max_depth: usize,
+    unrestricted: bool,
+) -> Result<Vec<PathBuf>, String> {
     let mut repositories = Vec::new();
     let mut seen = HashSet::new();
 
@@ -137,7 +163,14 @@ pub fn discover(roots: &[PathBuf], max_depth: usize) -> Result<Vec<PathBuf>, Str
         if !root.is_dir() {
             return Err(format!("'{}' is not a directory", root.display()));
         }
-        walk(&root, 0, max_depth, &mut repositories, &mut seen)?;
+        walk(
+            &root,
+            0,
+            max_depth,
+            unrestricted,
+            &mut repositories,
+            &mut seen,
+        )?;
     }
 
     Ok(repositories)
@@ -147,6 +180,7 @@ fn walk(
     directory: &Path,
     depth: usize,
     max_depth: usize,
+    unrestricted: bool,
     repositories: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<(), String> {
@@ -168,11 +202,26 @@ fn walk(
             Ok(file_type) => file_type,
             Err(_) => continue,
         };
-        if !file_type.is_dir() || file_type.is_symlink() || should_skip(&entry.file_name()) {
+        let name = entry.file_name();
+        // A repository's own git dir is never a place to look for repositories:
+        // descending into it surfaces .git/worktrees/<name> as phantom repos.
+        // Only the noise list is negotiable.
+        if !file_type.is_dir()
+            || file_type.is_symlink()
+            || is_git_metadata(&name)
+            || (!unrestricted && is_noise(&name))
+        {
             continue;
         }
         // Unreadable descendants are ignored so one protected cache does not hide other repos.
-        let _ = walk(&entry.path(), depth + 1, max_depth, repositories, seen);
+        let _ = walk(
+            &entry.path(),
+            depth + 1,
+            max_depth,
+            unrestricted,
+            repositories,
+            seen,
+        );
     }
     Ok(())
 }
@@ -182,20 +231,16 @@ fn looks_like_worktree(directory: &Path) -> bool {
     marker.is_file() || (marker.is_dir() && marker.join("HEAD").is_file())
 }
 
-fn should_skip(name: &std::ffi::OsStr) -> bool {
+/// Version-control metadata, skipped unconditionally.
+fn is_git_metadata(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some(".git" | ".hg" | ".svn"))
+}
+
+/// Dependency and build directories, skipped unless `--unrestricted`.
+fn is_noise(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some(
-            ".git"
-                | ".hg"
-                | ".svn"
-                | ".cache"
-                | ".tox"
-                | ".venv"
-                | "node_modules"
-                | "target"
-                | "vendor"
-        )
+        Some(".cache" | ".tox" | ".venv" | "node_modules" | "target" | "vendor")
     )
 }
 
@@ -237,6 +282,9 @@ fn inspect(path: &Path, tracked_only: bool) -> Report {
             let mut report = parse_status(&output.stdout);
             report.path = path.to_path_buf();
             report.operation = detect_operation(path);
+            // A `.git` file rather than a directory means a linked worktree or
+            // a submodule pointing at a git dir elsewhere.
+            report.worktree = path.join(".git").is_file();
             report
         }
         Ok(Some(output)) => {
@@ -255,12 +303,15 @@ fn error_report(path: &Path, message: String) -> Report {
         path: path.to_path_buf(),
         display_path: String::new(),
         branch: "-".into(),
+        detached: false,
+        head: None,
         upstream: None,
         upstream_gone: false,
         ahead: 0,
         behind: 0,
         stash: 0,
         operation: None,
+        worktree: false,
         changes: Changes::default(),
         error: Some(message),
     }
@@ -448,12 +499,15 @@ pub fn parse_status(bytes: &[u8]) -> Report {
         path: PathBuf::new(),
         display_path: String::new(),
         branch: "-".into(),
+        detached: false,
+        head: None,
         upstream: None,
         upstream_gone: false,
         ahead: 0,
         behind: 0,
         stash: 0,
         operation: None,
+        worktree: false,
         changes: Changes::default(),
         error: None,
     };
@@ -473,8 +527,14 @@ pub fn parse_status(bytes: &[u8]) -> Report {
             continue;
         }
         let record = String::from_utf8_lossy(raw_record);
-        if let Some(value) = record.strip_prefix("# branch.head ") {
-            report.branch = if value == "(detached)" {
+        if let Some(value) = record.strip_prefix("# branch.oid ") {
+            // "(initial)" on an unborn branch is a git sentinel, not an oid.
+            if value != "(initial)" {
+                report.head = Some(value.into());
+            }
+        } else if let Some(value) = record.strip_prefix("# branch.head ") {
+            report.detached = value == "(detached)";
+            report.branch = if report.detached {
                 "detached".into()
             } else {
                 value.into()
@@ -606,6 +666,84 @@ mod tests {
     }
 
     #[test]
+    fn captures_head_oid_and_detached_state() {
+        let attached = parse_status(
+            concat!(
+                "# branch.oid 1a2b3c4d\0",
+                "# branch.head main\0",
+                "# branch.upstream origin/main\0",
+                "# branch.ab +0 -0\0",
+            )
+            .as_bytes(),
+        );
+        assert_eq!(attached.head.as_deref(), Some("1a2b3c4d"));
+        assert!(!attached.detached);
+        assert!(!attached.unpublished(), "it has an upstream");
+
+        let detached = parse_status(
+            concat!("# branch.oid 1a2b3c4d\0", "# branch.head (detached)\0").as_bytes(),
+        );
+        assert!(detached.detached);
+        assert_eq!(detached.branch, "detached");
+        assert!(
+            !detached.unpublished(),
+            "a detached HEAD has no branch to publish"
+        );
+
+        // An unborn branch reports a sentinel rather than an oid.
+        let unborn = parse_status(concat!("# branch.oid (initial)\0", "# branch.head main\0").as_bytes());
+        assert_eq!(unborn.head, None);
+    }
+
+    #[test]
+    fn flags_a_never_pushed_branch_as_unpublished() {
+        let report = parse_status(concat!("# branch.oid abc\0", "# branch.head feature\0").as_bytes());
+
+        assert!(report.upstream.is_none());
+        assert_eq!((report.ahead, report.behind), (0, 0));
+        assert_eq!(report.state(), State::Clean);
+        assert!(
+            report.unpublished(),
+            "a branch with no upstream is indistinguishable from in-sync without this"
+        );
+    }
+
+    #[test]
+    fn unrestricted_reaches_repos_under_skipped_directories() {
+        let root = unique_temp_dir("repo-scout-unrestricted");
+        let vendored = root.join("vendor/dep/.git");
+        let phantom = root.join("plain/.git/worktrees/wt");
+        fs::create_dir_all(&vendored).unwrap();
+        fs::create_dir_all(&phantom).unwrap();
+        fs::write(vendored.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        // A git dir's own bookkeeping is repo-shaped and must never be walked.
+        fs::write(phantom.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(root.join("plain/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let canonical = fs::canonicalize(&root).unwrap();
+        let default = discover(std::slice::from_ref(&root), 4, false).unwrap();
+        assert_eq!(
+            default,
+            vec![canonical.join("plain")],
+            "vendor/ is skipped by default"
+        );
+
+        let unrestricted = discover(std::slice::from_ref(&root), 4, true).unwrap();
+        assert!(
+            unrestricted.contains(&canonical.join("vendor/dep")),
+            "--unrestricted must reach vendored repositories"
+        );
+        assert!(
+            !unrestricted
+                .iter()
+                .any(|path| path.components().any(|part| part.as_os_str() == ".git")),
+            "--unrestricted must never descend into a .git dir: {unrestricted:?}"
+        );
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn reports_gone_upstream_when_branch_ab_is_absent() {
         let input = concat!(
             "# branch.oid abc123\0",
@@ -673,12 +811,15 @@ mod tests {
             path: PathBuf::new(),
             display_path: String::new(),
             branch: "main".into(),
+            detached: false,
+            head: None,
             upstream: Some("origin/main".into()),
             upstream_gone: false,
             ahead: 0,
             behind: 0,
             stash: 0,
             operation: None,
+            worktree: false,
             changes: Changes::default(),
             error: None,
         };
@@ -1020,7 +1161,7 @@ mod tests {
         fs::write(nested.join("HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(ignored.join("HEAD"), "ref: refs/heads/main\n").unwrap();
 
-        let repositories = discover(std::slice::from_ref(&root), 4).unwrap();
+        let repositories = discover(std::slice::from_ref(&root), 4, false).unwrap();
         // discover() canonicalizes roots; on macOS the temp dir itself is a
         // symlink (/var -> /private/var), so the expectation must match.
         let canonical_root = fs::canonicalize(&root).unwrap();
@@ -1041,7 +1182,7 @@ mod tests {
         fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::write(root.join("nested/.git/HEAD"), "ref: refs/heads/main\n").unwrap();
 
-        let repositories = discover(std::slice::from_ref(&root), 0).unwrap();
+        let repositories = discover(std::slice::from_ref(&root), 0, false).unwrap();
         assert_eq!(repositories, vec![fs::canonicalize(&root).unwrap()]);
 
         fs::remove_dir_all(root).unwrap();
@@ -1056,7 +1197,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("repo-scout-fake-test-{unique}"));
         fs::create_dir_all(root.join("not-a-repo/.git")).unwrap();
 
-        let repositories = discover(std::slice::from_ref(&root), 2).unwrap();
+        let repositories = discover(std::slice::from_ref(&root), 2, false).unwrap();
         assert!(repositories.is_empty());
 
         fs::remove_dir_all(root).unwrap();

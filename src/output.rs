@@ -45,6 +45,13 @@ pub fn print_table(reports: &[Report], color: bool) {
             changes_text(&report.changes, report.stash),
             report.display_path
         );
+    }
+}
+
+/// Per-repository failures, on stderr so they survive `--quiet` and never
+/// contaminate a redirected table.
+pub fn print_errors(reports: &[Report]) {
+    for report in reports {
         if let Some(error) = &report.error {
             eprintln!("  {}: {error}", report.display_path);
         }
@@ -172,24 +179,35 @@ fn truncate(value: &str, width: usize) -> String {
     result
 }
 
+/// Rows are only ever given new keys: consumers must ignore unknown ones, and
+/// the `state` value set stays closed so an existing `select(.state != "clean")`
+/// keeps selecting the same rows. Anything newly distinguishable therefore
+/// arrives as its own boolean rather than as a new `state`.
 pub fn print_json(reports: &[Report]) {
     println!("[");
     for (index, report) in reports.iter().enumerate() {
         let comma = if index + 1 == reports.len() { "" } else { "," };
         println!(
-            "  {{\"path\":{},\"state\":{},\"branch\":{},\"upstream\":{},\"upstream_gone\":{},\"ahead\":{},\"behind\":{},\"stash\":{},\"changes\":{{\"staged\":{},\"unstaged\":{},\"untracked\":{},\"conflicted\":{}}},\"error\":{}}}{comma}",
+            "  {{\"path\":{},\"display_path\":{},\"state\":{},\"branch\":{},\"detached\":{},\"head\":{},\"upstream\":{},\"upstream_gone\":{},\"unpublished\":{},\"ahead\":{},\"behind\":{},\"stash\":{},\"operation\":{},\"worktree\":{},\"changes\":{{\"staged\":{},\"unstaged\":{},\"untracked\":{},\"conflicted\":{}}},\"needs_attention\":{},\"error\":{}}}{comma}",
             json_string(&report.path.to_string_lossy()),
+            json_string(&report.display_path),
             json_string(report.state().label()),
             json_string(&report.branch),
+            report.detached,
+            json_optional(report.head.as_deref()),
             json_optional(report.upstream.as_deref()),
             report.upstream_gone,
+            report.unpublished(),
             report.ahead,
             report.behind,
             report.stash,
+            json_optional(report.operation.map(Operation::label)),
+            report.worktree,
             report.changes.staged,
             report.changes.unstaged,
             report.changes.untracked,
             report.changes.conflicted,
+            report.needs_attention(),
             json_optional(report.error.as_deref()),
         );
     }
@@ -243,12 +261,15 @@ mod tests {
             path: std::path::PathBuf::new(),
             display_path: String::new(),
             branch: "main".into(),
+            detached: false,
+            head: None,
             upstream: upstream.map(String::from),
             upstream_gone,
             ahead,
             behind,
             stash: 0,
             operation: None,
+            worktree: false,
             changes: Changes::default(),
             error: None,
         }

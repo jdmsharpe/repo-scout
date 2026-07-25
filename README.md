@@ -54,12 +54,27 @@ repo-scout --attention ~/src
 # Only repositories with changes, using a cheaper tracked-files-only check.
 repo-scout --dirty --tracked-only ~/src
 
+# A shell prompt or CI gate: no output, just an exit status.
+repo-scout -q -a ~/src || echo 'work is waiting'
+
+# Check a single repository without recursing.
+repo-scout --max-depth 0 .
+
+# Keep color when piping into a pager.
+repo-scout --color always -a ~/src | less -R
+
 # Machine-readable output across multiple roots.
-repo-scout --json ~/work ~/personal | jq '.[] | select(.state != "clean")'
+repo-scout --json ~/work ~/personal | jq '.[] | select(.needs_attention)'
+
+# Branches that have never been pushed anywhere.
+repo-scout --json ~/src | jq -r 'select(.unpublished) | .display_path'
 
 # Shell completions (bash, zsh, or fish).
 repo-scout --completions bash > ~/.local/share/bash-completion/completions/repo-scout
 ```
+
+repo-scout only ever reads. It runs one `git status` per repository and never
+fetches, checks out, or merges anything.
 
 `repo-scout --help` output follows.
 
@@ -75,27 +90,75 @@ OPTIONS:
     -a, --attention        Show only repositories needing attention: changes,
                            ahead/behind or gone upstreams, stashes, operations
                            in progress, and errors
-    -d, --dirty            Show only dirty repositories and errors
+    -d, --dirty            Show only dirty repositories and errors; combined
+                           with --attention it selects either
         --json             Emit a JSON array instead of a table
-    -j, --jobs <COUNT>     Concurrent Git processes (default: CPU count, max 16)
-        --max-depth <N>    Directory levels to search (default: 4)
-        --tracked-only     Skip untracked files for a faster scan
-        --no-color         Disable colored status labels
+    -j, --jobs <COUNT>     Concurrent Git processes (default: CPU count, up to
+                           16; 0 selects the default)
+        --max-depth <N>    Directory levels to search below each ROOT
+                           (default: 4; 0 checks each ROOT itself only)
+    -u, --unrestricted     Also descend into node_modules, target, vendor and
+                           the other skipped directories
+        --tracked-only     Skip untracked files for a faster scan; a repository
+                           whose only change is untracked files then counts as
+                           clean
+        --color <WHEN>     Color the STATE column: auto (default), always,
+                           never
+        --no-color         Alias for --color never
+    -q, --quiet            Print nothing on stdout; report by exit code
+                           (implies --exit-code)
+        --exit-code        Exit 3 when a shown repository needs attention
         --legend           Explain the table columns and states, then exit
         --completions <SHELL>
                            Print a completion script for bash, zsh, or fish
     -h, --help             Print help
     -V, --version          Print version
 
+EXIT CODES:
+    0                      nothing to report
+    1                      a repository could not be inspected
+    2                      usage error, or a ROOT that cannot be read
+    3                      a shown repository needs attention (--exit-code)
+
+ENVIRONMENT:
+    NO_COLOR               Never color output; --color always overrides it
+
 EXAMPLES:
     repo-scout ~/src
     repo-scout --attention ~/src
     repo-scout --dirty --tracked-only ~/src
-    repo-scout --json ~/work ~/personal
+    repo-scout -q --exit-code -a ~/src || echo 'work is waiting'
+    repo-scout --json ~/work ~/personal | jq '.[] | select(.needs_attention)'
 ```
 
-Common dependency and build directories (`node_modules`, `.venv`, `target`, and `vendor`) 
-are skipped during discovery.
+Common dependency and build directories (`node_modules`, `.venv`, `target`, and
+`vendor`) are skipped during discovery; `--unrestricted` descends into them
+anyway. A repository's own `.git` directory is never walked.
+
+## JSON output
+
+Each row carries the fields below. New keys are only ever **added** — consumers
+should ignore ones they do not recognize — and the `state` values stay a closed
+set, so an existing filter keeps selecting the same rows.
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `path` | string | Absolute, canonicalized |
+| `display_path` | string | Relative to the ROOT when exactly one was given; matches the table |
+| `state` | string | `clean`, `dirty`, `merge`, `rebase`, `cherry-pick`, `revert`, `bisect`, `error` |
+| `branch` | string | `detached` when HEAD is detached |
+| `detached` | bool | Distinguishes a detached HEAD from a branch named `detached` |
+| `head` | string \| null | Commit the worktree is on; `null` on an unborn branch |
+| `upstream` | string \| null | Configured upstream ref |
+| `upstream_gone` | bool | Upstream is configured but no longer exists on the remote |
+| `unpublished` | bool | On a branch that has never been pushed |
+| `ahead` / `behind` | number | Commits relative to the upstream |
+| `stash` | number | Stash entries (Git 2.35+) |
+| `operation` | string \| null | In-progress operation, if any |
+| `worktree` | bool | A linked worktree or submodule rather than a plain checkout |
+| `changes` | object | `staged`, `unstaged`, `untracked`, `conflicted` counts |
+| `needs_attention` | bool | What `--attention` and `--exit-code` select on |
+| `error` | string \| null | Why Git could not inspect this repository |
 
 ## Performance
 

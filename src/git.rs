@@ -691,13 +691,15 @@ mod tests {
         );
 
         // An unborn branch reports a sentinel rather than an oid.
-        let unborn = parse_status(concat!("# branch.oid (initial)\0", "# branch.head main\0").as_bytes());
+        let unborn =
+            parse_status(concat!("# branch.oid (initial)\0", "# branch.head main\0").as_bytes());
         assert_eq!(unborn.head, None);
     }
 
     #[test]
     fn flags_a_never_pushed_branch_as_unpublished() {
-        let report = parse_status(concat!("# branch.oid abc\0", "# branch.head feature\0").as_bytes());
+        let report =
+            parse_status(concat!("# branch.oid abc\0", "# branch.head feature\0").as_bytes());
 
         assert!(report.upstream.is_none());
         assert_eq!((report.ahead, report.behind), (0, 0));

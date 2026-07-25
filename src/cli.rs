@@ -269,8 +269,9 @@ fn parse_color(value: Option<&OsString>) -> Result<ColorWhen, String> {
 }
 
 fn parse_color_name(name: &str) -> Result<ColorWhen, String> {
-    ColorWhen::from_name(name)
-        .ok_or_else(|| format!("invalid value '{name}' for --color (expected auto, always, or never)"))
+    ColorWhen::from_name(name).ok_or_else(|| {
+        format!("invalid value '{name}' for --color (expected auto, always, or never)")
+    })
 }
 
 fn parse_shell(value: Option<&OsString>) -> Result<Shell, String> {

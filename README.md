@@ -26,15 +26,16 @@ dirty  dev     ↑2     1S 2M 1?  web
   Git 2.14+, where `--show-stash` was added)
 - `↑` / `↓`: commits ahead of / behind the upstream branch
 - `gone`: an upstream is configured but no longer exists on the remote
-- STATE also surfaces operations in progress: `merge`, `rebase`, `cherry-pick`,
-  `revert`, and `bisect`
+- STATE also surfaces operations in progress: `merge`, `rebase`, `am`,
+  `cherry-pick`, `revert`, and `bisect`
 
 Run `repo-scout --legend` for the full color-coded key.
 
 ## Build and install
 
 Prebuilt binaries for Linux (x86_64) and macOS (Intel and Apple Silicon) are attached to each
-[GitHub release](https://github.com/jdmsharpe/repo-scout/releases). Or build from source:
+[GitHub release](https://github.com/jdmsharpe/repo-scout/releases). Pushing a `v*` tag
+builds them and creates the Release if it does not already exist. Or build from source:
 
 ```bash
 cargo build --release
@@ -66,15 +67,16 @@ repo-scout --color always -a ~/src | less -R
 # Machine-readable output across multiple roots.
 repo-scout --json ~/work ~/personal | jq '.[] | select(.needs_attention)'
 
-# Branches that have never been pushed anywhere.
-repo-scout --json ~/src | jq -r 'select(.unpublished) | .display_path'
+# Branches with no upstream configured.
+repo-scout --json ~/src | jq -r '.[] | select(.unpublished) | .display_path'
 
 # Shell completions (bash, zsh, or fish).
 repo-scout --completions bash > ~/.local/share/bash-completion/completions/repo-scout
 ```
 
-repo-scout only ever reads. It runs one `git status` per repository and never
-fetches, checks out, or merges anything.
+repo-scout only ever reads. It runs one `git status` per worktree (or a
+`rev-parse` / `for-each-ref` pair for a bare repository) and never fetches,
+checks out, or merges anything.
 
 `repo-scout --help` output follows.
 
@@ -115,7 +117,7 @@ OPTIONS:
     -V, --version          Print version
 
 EXIT CODES:
-    0                      nothing to report
+    0                      success; with --exit-code, nothing to report
     1                      a repository could not be inspected
     2                      usage error, or a ROOT that cannot be read
     3                      a shown repository needs attention (--exit-code)
@@ -133,7 +135,9 @@ EXAMPLES:
 
 Common dependency and build directories (`node_modules`, `.venv`, `target`, and
 `vendor`) are skipped during discovery; `--unrestricted` descends into them
-anyway. A repository's own `.git` directory is never walked.
+anyway. A repository's own `.git` directory is never walked. Bare repositories
+(a `HEAD` file and `objects/` directory at the root) are included and not
+descended into.
 
 ## JSON output
 
@@ -145,17 +149,18 @@ set, so an existing filter keeps selecting the same rows.
 | --- | --- | --- |
 | `path` | string | Absolute, canonicalized |
 | `display_path` | string | Relative to the ROOT when exactly one was given; matches the table |
-| `state` | string | `clean`, `dirty`, `merge`, `rebase`, `cherry-pick`, `revert`, `bisect`, `error` |
+| `state` | string | `clean`, `dirty`, `merge`, `rebase`, `am`, `cherry-pick`, `revert`, `bisect`, `error` |
 | `branch` | string | `detached` when HEAD is detached |
 | `detached` | bool | Distinguishes a detached HEAD from a branch named `detached` |
 | `head` | string \| null | Commit the worktree is on; `null` on an unborn branch |
 | `upstream` | string \| null | Configured upstream ref |
 | `upstream_gone` | bool | Upstream is configured but no longer exists on the remote |
-| `unpublished` | bool | On a branch that has never been pushed |
+| `unpublished` | bool | No upstream is configured (includes `git push` without `-u`) |
 | `ahead` / `behind` | number | Commits relative to the upstream |
 | `stash` | number | Stash entries (Git 2.35+) |
 | `operation` | string \| null | In-progress operation, if any |
 | `worktree` | bool | A linked worktree or submodule rather than a plain checkout |
+| `bare` | bool | A bare repository (no worktree) |
 | `changes` | object | `staged`, `unstaged`, `untracked`, `conflicted` counts |
 | `needs_attention` | bool | What `--attention` and `--exit-code` select on |
 | `error` | string \| null | Why Git could not inspect this repository |

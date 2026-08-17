@@ -14,19 +14,19 @@ pub fn print_table(reports: &[Report], color: bool) {
         .max(5);
     let branch_width = reports
         .iter()
-        .map(|report| char_count(&report.branch))
+        .map(|report| display_width(&sanitize_text(&report.branch)))
         .max()
         .unwrap_or(6)
         .clamp(6, 28);
     let sync_width = reports
         .iter()
-        .map(|report| char_count(&sync_text(report)))
+        .map(|report| display_width(&sync_text(report)))
         .max()
         .unwrap_or(4)
         .max(4);
     let changes_width = reports
         .iter()
-        .map(|report| char_count(&changes_text(&report.changes, report.stash)))
+        .map(|report| display_width(&changes_text(&report.changes, report.stash)))
         .max()
         .unwrap_or(7)
         .max(7);
@@ -37,13 +37,15 @@ pub fn print_table(reports: &[Report], color: bool) {
     );
     for report in reports {
         let state = colored_state(report.state(), state_width, color);
-        let branch = truncate(&report.branch, branch_width);
+        let branch = pad_display(
+            &truncate(&sanitize_text(&report.branch), branch_width),
+            branch_width,
+        );
+        let sync = pad_display(&sync_text(report), sync_width);
+        let changes = pad_display(&changes_text(&report.changes, report.stash), changes_width);
         println!(
-            "{state}  {:<branch_width$}  {:<sync_width$}  {:<changes_width$}  {}",
-            branch,
-            sync_text(report),
-            changes_text(&report.changes, report.stash),
-            report.display_path
+            "{state}  {branch}  {sync}  {changes}  {}",
+            sanitize_text(&report.display_path)
         );
     }
 }
@@ -53,7 +55,11 @@ pub fn print_table(reports: &[Report], color: bool) {
 pub fn print_errors(reports: &[Report]) {
     for report in reports {
         if let Some(error) = &report.error {
-            eprintln!("  {}: {error}", report.display_path);
+            eprintln!(
+                "  {}: {}",
+                sanitize_text(&report.display_path),
+                sanitize_text(error)
+            );
         }
     }
 }
@@ -103,6 +109,7 @@ fn state_description(state: State) -> &'static str {
         State::Dirty => "the working tree or index has changes",
         State::InProgress(Operation::Merge) => "a merge is in progress",
         State::InProgress(Operation::Rebase) => "a rebase is in progress",
+        State::InProgress(Operation::Am) => "a mailbox apply (git am) is in progress",
         State::InProgress(Operation::CherryPick) => "a cherry-pick is in progress",
         State::InProgress(Operation::Revert) => "a revert is in progress",
         State::InProgress(Operation::Bisect) => "a bisect is in progress",
@@ -163,20 +170,83 @@ fn changes_text(changes: &Changes, stash: usize) -> String {
     parts.join(" ")
 }
 
-fn char_count(value: &str) -> usize {
-    value.chars().count()
+fn display_width(value: &str) -> usize {
+    value.chars().map(char_display_width).sum()
+}
+
+fn char_display_width(character: char) -> usize {
+    let code = character as u32;
+    match character {
+        '\u{00}'..='\u{1f}' | '\u{7f}' => 0,
+        '\u{0300}'..='\u{036f}'
+        | '\u{200b}'..='\u{200f}'
+        | '\u{fe00}'..='\u{fe0f}'
+        | '\u{fe20}'..='\u{fe2f}' => 0,
+        _ if (0xe0100..=0xe01ef).contains(&code) => 0,
+        _ if is_wide(code) => 2,
+        _ => 1,
+    }
+}
+
+fn is_wide(code: u32) -> bool {
+    matches!(
+        code,
+        0x1100..=0x115f
+            | 0x2329..=0x232a
+            | 0x2e80..=0x303e
+            | 0x3040..=0xa4cf
+            | 0xac00..=0xd7a3
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe19
+            | 0xfe30..=0xfe6f
+            | 0xff00..=0xff60
+            | 0xffe0..=0xffe6
+            | 0x1f300..=0x1faff
+            | 0x20000..=0x3fffd
+    )
+}
+
+fn pad_display(value: &str, width: usize) -> String {
+    let used = display_width(value);
+    if used >= width {
+        value.into()
+    } else {
+        format!("{value}{}", " ".repeat(width - used))
+    }
 }
 
 fn truncate(value: &str, width: usize) -> String {
-    if char_count(value) <= width {
+    if display_width(value) <= width {
         return value.into();
     }
     if width <= 1 {
         return "…".into();
     }
-    let mut result: String = value.chars().take(width - 1).collect();
+    let mut result = String::new();
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = char_display_width(character);
+        if used + character_width + 1 > width {
+            break;
+        }
+        result.push(character);
+        used += character_width;
+    }
     result.push('…');
     result
+}
+
+fn sanitize_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character < ' ' || character == '\u{7f}' {
+                '\u{FFFD}'
+            } else {
+                character
+            }
+        })
+        .collect()
 }
 
 /// Rows are only ever given new keys: consumers must ignore unknown ones, and
@@ -188,7 +258,7 @@ pub fn print_json(reports: &[Report]) {
     for (index, report) in reports.iter().enumerate() {
         let comma = if index + 1 == reports.len() { "" } else { "," };
         println!(
-            "  {{\"path\":{},\"display_path\":{},\"state\":{},\"branch\":{},\"detached\":{},\"head\":{},\"upstream\":{},\"upstream_gone\":{},\"unpublished\":{},\"ahead\":{},\"behind\":{},\"stash\":{},\"operation\":{},\"worktree\":{},\"changes\":{{\"staged\":{},\"unstaged\":{},\"untracked\":{},\"conflicted\":{}}},\"needs_attention\":{},\"error\":{}}}{comma}",
+            "  {{\"path\":{},\"display_path\":{},\"state\":{},\"branch\":{},\"detached\":{},\"head\":{},\"upstream\":{},\"upstream_gone\":{},\"unpublished\":{},\"ahead\":{},\"behind\":{},\"stash\":{},\"operation\":{},\"worktree\":{},\"bare\":{},\"changes\":{{\"staged\":{},\"unstaged\":{},\"untracked\":{},\"conflicted\":{}}},\"needs_attention\":{},\"error\":{}}}{comma}",
             json_string(&report.path.to_string_lossy()),
             json_string(&report.display_path),
             json_string(report.state().label()),
@@ -203,6 +273,7 @@ pub fn print_json(reports: &[Report]) {
             report.stash,
             json_optional(report.operation.map(Operation::label)),
             report.worktree,
+            report.bare,
             report.changes.staged,
             report.changes.unstaged,
             report.changes.untracked,
@@ -251,9 +322,20 @@ mod tests {
     }
 
     #[test]
-    fn truncates_by_characters() {
+    fn truncates_by_display_width() {
         assert_eq!(truncate("feature/very-long", 8), "feature…");
         assert_eq!(truncate("café", 4), "café");
+        assert_eq!(truncate("很长的分支名", 5), "很长…");
+        assert_eq!(display_width("🚀"), 2);
+        assert_eq!(truncate("🚀🚀🚀", 5), "🚀🚀…");
+    }
+
+    #[test]
+    fn sanitizes_control_characters_for_the_terminal() {
+        assert_eq!(sanitize_text("ok"), "ok");
+        assert_eq!(sanitize_text("new\nline"), "new\u{FFFD}line");
+        assert_eq!(sanitize_text("\u{1b}[31mevil"), "\u{FFFD}[31mevil");
+        assert_eq!(sanitize_text("bell\u{7}tab\t"), "bell\u{FFFD}tab\u{FFFD}");
     }
 
     fn report(upstream: Option<&str>, upstream_gone: bool, ahead: usize, behind: usize) -> Report {
@@ -270,6 +352,7 @@ mod tests {
             stash: 0,
             operation: None,
             worktree: false,
+            bare: false,
             changes: Changes::default(),
             error: None,
         }

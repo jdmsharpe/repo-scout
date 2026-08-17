@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 /// network mount or behind a wedged hook is reported as an error rather than
 /// stalling the entire scan.
 const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+/// Well-known empty tree. Set as `GIT_ATTR_SOURCE` so a scanned repository's
+/// `.gitattributes` cannot attach `filter.*` drivers that `git status` would run.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 /// How often to poll whether the spawned `git` has finished.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -33,6 +36,7 @@ impl Changes {
 pub enum Operation {
     Merge,
     Rebase,
+    Am,
     CherryPick,
     Revert,
     Bisect,
@@ -43,6 +47,7 @@ impl Operation {
         match self {
             Operation::Merge => "merge",
             Operation::Rebase => "rebase",
+            Operation::Am => "am",
             Operation::CherryPick => "cherry-pick",
             Operation::Revert => "revert",
             Operation::Bisect => "bisect",
@@ -61,11 +66,12 @@ pub enum State {
 
 impl State {
     /// Every state a report can show, in legend order.
-    pub const ALL: [State; 8] = [
+    pub const ALL: [State; 9] = [
         State::Clean,
         State::Dirty,
         State::InProgress(Operation::Merge),
         State::InProgress(Operation::Rebase),
+        State::InProgress(Operation::Am),
         State::InProgress(Operation::CherryPick),
         State::InProgress(Operation::Revert),
         State::InProgress(Operation::Bisect),
@@ -96,6 +102,7 @@ pub struct Report {
     pub stash: usize,
     pub operation: Option<Operation>,
     pub worktree: bool,
+    pub bare: bool,
     pub changes: Changes,
     pub error: Option<String>,
 }
@@ -105,9 +112,10 @@ impl Report {
         self.changes.any()
     }
 
-    /// A branch that has never been pushed. It reports no divergence and no
-    /// upstream, so nothing else on the row distinguishes it from a branch
-    /// that is genuinely in sync.
+    /// No upstream is configured for the current branch.
+    ///
+    /// That includes a branch that has never been pushed, but also one that
+    /// was pushed without `-u`. This is not a remote query.
     pub fn unpublished(&self) -> bool {
         self.error.is_none() && !self.detached && self.upstream.is_none()
     }
@@ -163,6 +171,10 @@ pub fn discover(
         if !root.is_dir() {
             return Err(format!("'{}' is not a directory", root.display()));
         }
+        // Probe here so `--max-depth 0` still errors on an unreadable ROOT
+        // instead of reporting an empty successful scan.
+        fs::read_dir(&root)
+            .map_err(|error| format!("cannot read '{}': {error}", root.display()))?;
         walk(
             &root,
             0,
@@ -184,10 +196,13 @@ fn walk(
     repositories: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
 ) -> Result<(), String> {
-    if looks_like_worktree(directory) && seen.insert(directory.to_path_buf()) {
+    let worktree = looks_like_worktree(directory);
+    let bare = !worktree && looks_like_bare(directory);
+    if (worktree || bare) && seen.insert(directory.to_path_buf()) {
         repositories.push(directory.to_path_buf());
     }
-    if depth >= max_depth {
+    // A bare repo is the git dir: descending would walk objects/ and refs/.
+    if bare || depth >= max_depth {
         return Ok(());
     }
 
@@ -229,6 +244,12 @@ fn walk(
 fn looks_like_worktree(directory: &Path) -> bool {
     let marker = directory.join(".git");
     marker.is_file() || (marker.is_dir() && marker.join("HEAD").is_file())
+}
+
+fn looks_like_bare(directory: &Path) -> bool {
+    !directory.join(".git").exists()
+        && directory.join("HEAD").is_file()
+        && directory.join("objects").is_dir()
 }
 
 /// Version-control metadata, skipped unconditionally.
@@ -277,6 +298,9 @@ pub fn inspect_all(repositories: Vec<PathBuf>, jobs: usize, tracked_only: bool) 
 }
 
 fn inspect(path: &Path, tracked_only: bool) -> Report {
+    if looks_like_bare(path) {
+        return inspect_bare(path);
+    }
     match run_status(path, tracked_only) {
         Ok(Some(output)) if output.status.success() => {
             let mut report = parse_status(&output.stdout);
@@ -312,18 +336,128 @@ fn error_report(path: &Path, message: String) -> Report {
         stash: 0,
         operation: None,
         worktree: false,
+        bare: looks_like_bare(path),
         changes: Changes::default(),
         error: Some(message),
     }
 }
 
+fn inspect_bare(path: &Path) -> Report {
+    let timeout = format!("Git timed out after {} s", STATUS_TIMEOUT.as_secs());
+    let symbolic = match run_git(path, &["symbolic-ref", "--short", "HEAD"]) {
+        Ok(Some(output)) => output,
+        Ok(None) => return error_report(path, timeout),
+        Err(error) => return error_report(path, format!("could not run Git: {error}")),
+    };
+
+    let mut report = Report {
+        path: path.to_path_buf(),
+        display_path: String::new(),
+        branch: "-".into(),
+        detached: false,
+        head: None,
+        upstream: None,
+        upstream_gone: false,
+        ahead: 0,
+        behind: 0,
+        stash: 0,
+        operation: detect_operation(path),
+        worktree: false,
+        bare: true,
+        changes: Changes::default(),
+        error: None,
+    };
+
+    if symbolic.status.success() {
+        let branch = String::from_utf8_lossy(&symbolic.stdout).trim().to_owned();
+        if !branch.is_empty() {
+            report.branch = branch;
+        }
+    } else {
+        report.detached = true;
+        report.branch = "detached".into();
+    }
+
+    match run_git(path, &["rev-parse", "HEAD"]) {
+        Ok(None) => return error_report(path, timeout),
+        Ok(Some(output)) if output.status.success() => {
+            let oid = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            if !oid.is_empty() {
+                report.head = Some(oid);
+            }
+        }
+        Ok(Some(_)) => {}
+        Err(error) => return error_report(path, format!("could not run Git: {error}")),
+    }
+
+    if !report.detached {
+        let spec = format!("refs/heads/{}", report.branch);
+        match run_git(
+            path,
+            &[
+                "for-each-ref",
+                "--format=%(objectname)%01%(upstream:short)%01%(upstream:track,nobracket)",
+                &spec,
+            ],
+        ) {
+            Ok(None) => return error_report(path, timeout),
+            Ok(Some(output)) if output.status.success() => {
+                parse_bare_ref(String::from_utf8_lossy(&output.stdout).trim(), &mut report);
+            }
+            Ok(Some(_)) => {}
+            Err(error) => return error_report(path, format!("could not run Git: {error}")),
+        }
+    }
+
+    report
+}
+
+fn parse_bare_ref(line: &str, report: &mut Report) {
+    if line.is_empty() {
+        return;
+    }
+    let mut parts = line.split('\u{1}');
+    if let Some(oid) = parts.next()
+        && !oid.is_empty()
+    {
+        report.head = Some(oid.into());
+    }
+    if let Some(upstream) = parts.next()
+        && !upstream.is_empty()
+    {
+        report.upstream = Some(upstream.into());
+    }
+    if let Some(track) = parts.next() {
+        let track = track.trim();
+        if track == "gone" {
+            report.upstream_gone = true;
+        } else {
+            for chunk in track.split(',') {
+                let chunk = chunk.trim();
+                if let Some(ahead) = chunk.strip_prefix("ahead ") {
+                    report.ahead = ahead.parse().unwrap_or(0);
+                } else if let Some(behind) = chunk.strip_prefix("behind ") {
+                    report.behind = behind.parse().unwrap_or(0);
+                }
+            }
+        }
+    }
+}
+
 /// Detects an in-progress operation from the repository's private git dir.
-/// Ordering mirrors `git status`: a conflicted rebase also leaves
-/// CHERRY_PICK_HEAD behind, so the rebase directories are checked first.
+/// Ordering mirrors `git status`: `rebase-apply/applying` is `git am`,
+/// anything else in `rebase-apply` (or `rebase-merge`) is a rebase, and a
+/// conflicted rebase also leaves CHERRY_PICK_HEAD behind.
 fn detect_operation(worktree: &Path) -> Option<Operation> {
     let git_dir = resolve_git_dir(worktree)?;
-    if git_dir.join("rebase-merge").is_dir() || git_dir.join("rebase-apply").is_dir() {
+    if git_dir.join("rebase-merge").is_dir() {
         Some(Operation::Rebase)
+    } else if git_dir.join("rebase-apply").is_dir() {
+        if git_dir.join("rebase-apply").join("applying").is_file() {
+            Some(Operation::Am)
+        } else {
+            Some(Operation::Rebase)
+        }
     } else if git_dir.join("MERGE_HEAD").is_file() {
         Some(Operation::Merge)
     } else if git_dir.join("CHERRY_PICK_HEAD").is_file() {
@@ -339,7 +473,12 @@ fn detect_operation(worktree: &Path) -> Option<Operation> {
 
 fn resolve_git_dir(worktree: &Path) -> Option<PathBuf> {
     let marker = worktree.join(".git");
-    let file_type = fs::metadata(&marker).ok()?.file_type();
+    let file_type = match fs::metadata(&marker) {
+        Ok(metadata) => metadata.file_type(),
+        Err(_) => {
+            return looks_like_bare(worktree).then(|| worktree.to_path_buf());
+        }
+    };
     if file_type.is_dir() {
         return Some(marker);
     }
@@ -370,6 +509,30 @@ fn resolve_git_dir(worktree: &Path) -> Option<PathBuf> {
 
 fn run_status(path: &Path, tracked_only: bool) -> io::Result<Option<Output>> {
     run_with_timeout(status_command(path, tracked_only), STATUS_TIMEOUT)
+}
+
+fn run_git(git_dir: &Path, args: &[&str]) -> io::Result<Option<Output>> {
+    let mut command = Command::new("git");
+    configure_git(&mut command);
+    command.arg("--git-dir").arg(git_dir).args(args);
+    run_with_timeout(command, STATUS_TIMEOUT)
+}
+
+fn configure_git(command: &mut Command) {
+    command
+        .arg("-c")
+        .arg("color.ui=false")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .env("GIT_ATTR_SOURCE", EMPTY_TREE)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY");
 }
 
 /// Spawns `command`, draining its pipes on helper threads so a large status
@@ -448,14 +611,8 @@ fn kill_and_reap(mut child: Child) {
 fn status_command(path: &Path, tracked_only: bool) -> Command {
     let untracked = if tracked_only { "no" } else { "normal" };
     let mut command = Command::new("git");
+    configure_git(&mut command);
     command
-        .arg("-c")
-        .arg("color.ui=false")
-        // A scanned repository's own config must not be able to run code:
-        // core.fsmonitor can be set to an arbitrary command that `git status`
-        // would execute. A command-line -c outranks the repo's config.
-        .arg("-c")
-        .arg("core.fsmonitor=false")
         .arg("-C")
         .arg(path)
         .arg("status")
@@ -467,17 +624,7 @@ fn status_command(path: &Path, tracked_only: bool) -> Command {
         // this tool already had for --porcelain=v2.
         .arg("--show-stash")
         .arg("-z")
-        .arg(format!("--untracked-files={untracked}"))
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("LC_ALL", "C")
-        // `git -C` changes directory but still honors an inherited GIT_DIR, so
-        // clear the ambient repo env or every repo reports GIT_DIR's status.
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_OBJECT_DIRECTORY");
+        .arg(format!("--untracked-files={untracked}"));
     command
 }
 
@@ -508,6 +655,7 @@ pub fn parse_status(bytes: &[u8]) -> Report {
         stash: 0,
         operation: None,
         worktree: false,
+        bare: false,
         changes: Changes::default(),
         error: None,
     };
@@ -663,6 +811,16 @@ mod tests {
                 .any(|(name, value)| name == OsStr::new(key) && value.is_none());
             assert!(cleared, "{key} must be cleared from the child environment");
         }
+
+        let attr_source = command
+            .get_envs()
+            .find(|(key, _)| *key == OsStr::new("GIT_ATTR_SOURCE"))
+            .and_then(|(_, value)| value);
+        assert_eq!(
+            attr_source,
+            Some(OsStr::new(EMPTY_TREE)),
+            "GIT_ATTR_SOURCE must ignore the repo's .gitattributes"
+        );
     }
 
     #[test]
@@ -822,6 +980,7 @@ mod tests {
             stash: 0,
             operation: None,
             worktree: false,
+            bare: false,
             changes: Changes::default(),
             error: None,
         };
@@ -885,6 +1044,17 @@ mod tests {
         fs::create_dir_all(git_dir.join("rebase-merge")).unwrap();
         assert_eq!(detect_operation(&root), Some(Operation::Rebase));
 
+        fs::remove_dir_all(git_dir.join("rebase-merge")).unwrap();
+        fs::remove_file(git_dir.join("CHERRY_PICK_HEAD")).unwrap();
+        fs::create_dir_all(git_dir.join("rebase-apply")).unwrap();
+        assert_eq!(
+            detect_operation(&root),
+            Some(Operation::Rebase),
+            "rebase-apply without applying/ is a rebase"
+        );
+        fs::write(git_dir.join("rebase-apply/applying"), "").unwrap();
+        assert_eq!(detect_operation(&root), Some(Operation::Am));
+
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -923,6 +1093,51 @@ mod tests {
         assert_eq!(report.stash, 1);
         assert!(!report.is_dirty());
         assert_eq!(report.state(), State::Clean);
+        assert!(report.needs_attention());
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn inspect_reports_am_in_progress() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-am");
+        fs::create_dir_all(&root).unwrap();
+
+        init_main_repo(&root);
+        fs::write(root.join("file.txt"), "base\n").unwrap();
+        git(&root, &["add", "file.txt"]);
+        git(&root, &["commit", "-q", "-m", "base"]);
+        fs::write(root.join("file.txt"), "patch\n").unwrap();
+        git(&root, &["add", "file.txt"]);
+        git(&root, &["commit", "-q", "-m", "patch"]);
+        let patches = root.join("patches");
+        fs::create_dir_all(&patches).unwrap();
+        git(
+            &root,
+            &["format-patch", "-q", "-1", "-o", patches.to_str().unwrap()],
+        );
+        git(&root, &["reset", "-q", "--hard", "HEAD~1"]);
+        fs::write(root.join("file.txt"), "other\n").unwrap();
+        git(&root, &["add", "file.txt"]);
+        git(&root, &["commit", "-q", "-m", "diverge"]);
+        let patch = fs::read_dir(&patches)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(
+            !git_allowing_failure(&root, &["am", "--3way", patch.to_str().unwrap()]),
+            "the fixture am must conflict"
+        );
+
+        let report = inspect(&root, false);
+
+        assert!(report.error.is_none(), "status errored: {:?}", report.error);
+        assert_eq!(report.state(), State::InProgress(Operation::Am));
         assert!(report.needs_attention());
 
         fs::remove_dir_all(&root).unwrap();
@@ -1041,6 +1256,41 @@ mod tests {
     }
 
     #[test]
+    fn inspect_ignores_hostile_clean_filter() {
+        if !git_available() || !git_version_at_least(2, 43) {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-filter");
+        fs::create_dir_all(&root).unwrap();
+        let sentinel = root.join("PWNED");
+
+        init_main_repo(&root);
+        fs::write(root.join("tracked.bin"), "one\n").unwrap();
+        git(&root, &["add", "tracked.bin"]);
+        git(&root, &["commit", "-q", "-m", "init"]);
+        git(
+            &root,
+            &[
+                "config",
+                "filter.evil.clean",
+                &format!("touch {}; cat", sentinel.display()),
+            ],
+        );
+        fs::write(root.join(".gitattributes"), "*.bin filter=evil\n").unwrap();
+        fs::write(root.join("tracked.bin"), "two\n").unwrap();
+
+        let report = inspect(&root, false);
+
+        assert!(
+            !sentinel.exists(),
+            "a scanned repo's filter.*.clean command must never run"
+        );
+        assert!(report.error.is_none(), "status errored: {:?}", report.error);
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn inspect_ignores_hostile_fsmonitor_config() {
         if !git_available() {
             return;
@@ -1125,7 +1375,10 @@ mod tests {
     }
 
     fn git_supports_porcelain_stash() -> bool {
-        // The `# stash` porcelain v2 header arrived in Git 2.35.
+        git_version_at_least(2, 35)
+    }
+
+    fn git_version_at_least(major: u32, minor: u32) -> bool {
         let Ok(output) = Command::new("git").arg("--version").output() else {
             return false;
         };
@@ -1136,9 +1389,9 @@ mod tests {
             .unwrap_or_default()
             .split('.')
             .map_while(|part| part.parse::<u32>().ok());
-        let major = numbers.next().unwrap_or(0);
-        let minor = numbers.next().unwrap_or(0);
-        (major, minor) >= (2, 35)
+        let found_major = numbers.next().unwrap_or(0);
+        let found_minor = numbers.next().unwrap_or(0);
+        (found_major, found_minor) >= (major, minor)
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -1170,6 +1423,64 @@ mod tests {
         assert_eq!(repositories, vec![canonical_root.join("projects/one")]);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn discovers_bare_repositories_and_does_not_descend() {
+        let root = unique_temp_dir("repo-scout-bare");
+        let bare = root.join("mirrors/app.git");
+        fs::create_dir_all(bare.join("objects")).unwrap();
+        fs::write(bare.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(bare.join("objects/pack")).unwrap();
+
+        let repositories = discover(std::slice::from_ref(&root), 4, false).unwrap();
+        let canonical_root = fs::canonicalize(&root).unwrap();
+        assert_eq!(repositories, vec![canonical_root.join("mirrors/app.git")]);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_root_is_an_error_even_at_depth_zero() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = unique_temp_dir("repo-scout-locked");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = discover(std::slice::from_ref(&root), 0, false);
+        let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o700));
+        let _ = fs::remove_dir_all(&root);
+
+        let error = result.expect_err("an unreadable ROOT must be exit-2, not an empty scan");
+        assert!(error.contains("cannot read"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn inspects_an_unborn_bare_repository() {
+        if !git_available() {
+            return;
+        }
+        let root = unique_temp_dir("repo-scout-bare-inspect");
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "--bare", "-q"]);
+
+        let report = inspect(&root, false);
+
+        assert!(
+            report.error.is_none(),
+            "bare inspect errored: {:?}",
+            report.error
+        );
+        assert!(report.bare);
+        assert!(!report.worktree);
+        assert_eq!(report.state(), State::Clean);
+        assert!(report.unpublished());
+        assert!(!report.needs_attention());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

@@ -43,7 +43,7 @@ OPTIONS:
     -V, --version          Print version
 
 EXIT CODES:
-    0                      nothing to report
+    0                      success; with --exit-code, nothing to report
     1                      a repository could not be inspected
     2                      usage error, or a ROOT that cannot be read
     3                      a shown repository needs attention (--exit-code)

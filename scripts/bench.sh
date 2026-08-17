@@ -153,12 +153,16 @@ ln -s -- "$repo_scout_binary" "$repo_scout_benchmark_binary"
 create_repository() {
   local repository_path=$1
   local label=$2
-  git init --quiet --initial-branch=main "$repository_path"
+  mkdir -p -- "$repository_path"
+  git init --quiet "$repository_path"
+  git -C "$repository_path" symbolic-ref HEAD refs/heads/main
   printf 'fixture: %s\n' "$label" >"$repository_path/fixture.txt"
   git -C "$repository_path" add fixture.txt
   git -C "$repository_path" \
     -c user.name=repo-scout-benchmark \
     -c user.email=benchmark@example.invalid \
+    -c commit.gpgsign=false \
+    -c core.hooksPath=/dev/null \
     commit --quiet --message='Create benchmark fixture'
 }
 
@@ -205,6 +209,8 @@ done
 git -C "$repo_scout_submodule_parent" \
   -c user.name=repo-scout-benchmark \
   -c user.email=benchmark@example.invalid \
+  -c commit.gpgsign=false \
+  -c core.hooksPath=/dev/null \
   commit --quiet --message='Add benchmark submodules'
 
 printf 'Fixtures: %s repos, %s untracked files, %s submodules\n' \

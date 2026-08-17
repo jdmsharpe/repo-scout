@@ -103,6 +103,7 @@ complete -c repo-scout -l legend -d 'Explain the table columns and states'
 complete -c repo-scout -l completions -x -a 'bash zsh fish' -d 'Print a completion script'
 complete -c repo-scout -s h -l help -d 'Print help'
 complete -c repo-scout -s V -l version -d 'Print version'
+complete -c repo-scout -f -a '(__fish_complete_directories)'
 "#;
 
 /// Every long flag advertised in the help text. Shared by the completion
@@ -178,6 +179,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fish_completes_directories() {
+        assert!(
+            Shell::Fish.script().contains("__fish_complete_directories"),
+            "fish script must complete ROOT directories"
+        );
     }
 
     #[test]

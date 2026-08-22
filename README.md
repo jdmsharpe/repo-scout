@@ -5,6 +5,7 @@
 [![License](https://img.shields.io/github/license/jdmsharpe/repo-scout?label=license)](./LICENSE)
 [![CI](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml/badge.svg)](https://github.com/jdmsharpe/repo-scout/actions/workflows/ci.yml)
 [![Dependencies](https://deps.rs/repo/github/jdmsharpe/repo-scout/status.svg)](https://deps.rs/repo/github/jdmsharpe/repo-scout)
+[![Rust](https://img.shields.io/badge/rust-2024%20edition-000000?logo=rust&logoColor=white)](https://www.rust-lang.org/tools/install)
 
 `repo-scout` scans a directory full of Git repositories and shows which ones need
 attention. Repository checks run concurrently, and the release binary has no
